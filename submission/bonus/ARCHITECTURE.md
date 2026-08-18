@@ -1,153 +1,153 @@
-# Architecture Brief — Tu chính CDC ride-hailing Việt Nam vào Lakehouse
+# Bản mô tả kiến trúc — Đưa CDC ride-hailing Việt Nam vào Lakehouse
 
-**Topic:** CDC từ Oracle/Debezium vào Lakehouse, tuân thủ Nghị định 13/2023/NĐ-CP
-**Author:** Tran Quang Trong — 2A202601461
-**Status:** Design proposal for review
+**Chủ đề:** CDC từ Oracle/Debezium vào Lakehouse, tuân thủ Nghị định 13/2023/NĐ-CP
+**Tác giả:** Tran Quang Trong — 2A202601461
+**Trạng thái:** Đề xuất thiết kế
 
-## 1. Problem statement
+## 1. Mô tả bài toán
 
 Hệ thống ride-hailing ghi khoảng 100 triệu chuyến mỗi năm và đạt đỉnh 30.000 thay đổi/giây từ Oracle. Dữ liệu gồm trạng thái chuyến, giá tiền, số điện thoại, mã định danh và GPS của tài xế/hành khách. Đội phân tích cần dashboard cập nhật trong 60 giây từ lúc source commit và truy vấn ad-hoc p95 dưới 1 giây. Sự kiện đến muộn thường xuyên vì kết nối ở tỉnh xa không ổn định. Dữ liệu PII thuộc phạm vi Nghị định 13/2023/NĐ-CP: con người không được đọc PII chưa xử lý, mọi lần truy cập phải có audit, và phải hỗ trợ xóa hoặc chứng minh lịch sử thay đổi.
 
 Bài toán khó vì CDC phải có thứ tự và idempotency, nhưng dữ liệu đến muộn; schema Oracle thay đổi độc lập với consumer; dashboard cần dữ liệu nóng trong khi lịch sử phải rẻ; và rollback một bản sửa sai không được làm mất lineage hoặc làm lộ PII.
 
-## 2. Proposed architecture
+## 2. Kiến trúc đề xuất
 
 ```text
 Oracle OLTP
    │  redo log / transaction commit SCN
    ▼
-Debezium CDC ──► Kafka (raw events, schema registry, 24h replay)
+Debezium CDC ──► Kafka (sự kiện thô, schema registry, replay 24 giờ)
    │                         │
-   │                         └──► dead-letter topic + alert
+   │                         └──► dead-letter topic + cảnh báo
    ▼
-Encrypted quarantine (break-glass only; KMS, 7 days)
-   │ tokenise phone/ID/GPS before human-readable access
+Vùng cách ly mã hóa (chỉ break-glass; KMS, 7 ngày)
+   │ token hóa phone/ID/GPS trước khi con người được đọc
    ▼
-Delta Bronze: append-only sanitized CDC + operation/SCN/source_ts
+Delta Bronze: CDC đã làm sạch, chỉ append + operation/SCN/source_ts
    │  checkpoint + CDF + quality gates
    ▼
-Delta Silver: SCD2 trip history, late-data MERGE, typed/tokenized PII
+Delta Silver: lịch sử chuyến SCD2, MERGE dữ liệu trễ, PII đã kiểu hóa/token hóa
    │                    │
-   │                    └──► CDF consumers: fraud/features/audit
+   │                    └──► CDF consumers: gian lận/feature/audit
    ▼
-Delta Gold: current-trip + daily/city/driver aggregates
+Delta Gold: chuyến hiện tại + tổng hợp theo ngày/thành phố/tài xế
    │
-   ├──► dashboard service (last 7 days, Z-order by city_id/event_ts)
-   └──► analyst SQL (row/column policy, audit every PII-sensitive read)
+   ├──► dịch vụ dashboard (7 ngày gần nhất, Z-order theo city_id/event_ts)
+   └──► SQL phân tích (row/column policy, audit mọi lượt đọc nhạy cảm với PII)
 
-REST catalog + RBAC/policy engine + lineage store + audit table
+REST catalog + RBAC/policy engine + kho lineage + bảng audit
 ```
 
-The encrypted quarantine is not an analyst-facing Bronze table. It is a short-lived recovery buffer. The first human-readable layer is the sanitized Delta Bronze table, so accidental SQL access cannot reveal raw phone numbers, identity numbers or exact GPS.
+Vùng cách ly mã hóa không phải là bảng Bronze dành cho analyst. Đây là bộ đệm khôi phục có thời gian sống ngắn. Lớp đầu tiên con người có thể đọc là Delta Bronze đã làm sạch, vì vậy một câu lệnh SQL vô tình cũng không làm lộ số điện thoại, mã định danh hoặc GPS chính xác.
 
-## 3. Key decisions and rejected alternatives
+## 3. Các quyết định chính và phương án bị loại
 
-### Decision 1 — Delta Lake as the table format
+### Quyết định 1 — Chọn Delta Lake làm định dạng bảng
 
-I choose **Delta Lake** because this workload needs high-rate append, Change Data Feed (CDF), idempotent `MERGE`, schema enforcement and time-travel rollback. CDF lets downstream consumers receive an update/delete event rather than repeatedly scanning the whole table. SCD2 corrections can be audited by version.
+Mình chọn **Delta Lake** vì workload này cần append tốc độ cao, Change Data Feed (CDF), `MERGE` có tính idempotent, schema enforcement và rollback bằng time travel. CDF cho phép hệ thống hạ nguồn nhận một sự kiện update/delete thay vì quét lại toàn bộ bảng. Các chỉnh sửa SCD2 có thể được audit theo từng version.
 
-I reject **plain Parquet** because it has no atomic transaction log, reliable concurrent-writer protocol or native CDC contract. I reject **Iceberg as the primary format** because it is excellent for hidden partitioning and multi-engine reads, but the critical first requirement here is Delta CDF plus the existing Spark/SQL MERGE ecosystem; adding a separate CDC bridge would increase operational surface. Iceberg remains a valid future interchange format for curated exports.
+Mình loại **Parquet thuần** vì nó không có transaction log nguyên tử, giao thức ghi đồng thời đáng tin cậy hay hợp đồng CDC gốc. Mình không chọn **Iceberg làm định dạng chính** vì dù Iceberg mạnh về hidden partitioning và đọc đa engine, yêu cầu cấp thiết đầu tiên ở đây là Delta CDF cùng hệ sinh thái Spark/SQL có `MERGE`; thêm một cầu nối CDC riêng sẽ làm tăng bề mặt vận hành. Iceberg vẫn là định dạng trao đổi hợp lệ cho các bản export đã curate trong tương lai.
 
-### Decision 2 — Kafka + Debezium instead of polling Oracle
+### Quyết định 2 — Dùng Kafka + Debezium thay vì polling Oracle
 
-I choose **Debezium reading Oracle redo/LogMiner into Kafka**, carrying source commit SCN, operation type and schema version. Kafka gives replay, back-pressure and a durable hand-off between source capture and lakehouse writers.
+Mình chọn **Debezium đọc redo/LogMiner của Oracle rồi đưa vào Kafka**, mang theo source commit SCN, loại thao tác và phiên bản schema. Kafka cung cấp replay, back-pressure và một điểm bàn giao bền vững giữa việc bắt sự kiện nguồn và writer của lakehouse.
 
-I reject **timestamp polling** because updates with the same timestamp can be missed or duplicated, and deletes are difficult to reconstruct. I reject **direct Oracle-to-Parquet batch export** because a slow export would block the 60-second freshness SLA and offers no independent replay buffer when the lakehouse is unavailable.
+Mình loại **polling theo timestamp** vì các update có cùng timestamp có thể bị bỏ sót hoặc lặp lại, còn delete rất khó tái dựng. Mình loại **batch export trực tiếp Oracle-to-Parquet** vì một lần export chậm sẽ vi phạm SLA freshness 60 giây và không có vùng replay độc lập khi lakehouse tạm thời không hoạt động.
 
-### Decision 3 — Tokenisation before the readable Bronze layer
+### Quyết định 3 — Token hóa trước lớp Bronze có thể đọc
 
-I choose **deterministic tokenisation** for phone and identity fields using an HSM/KMS-held key, and coarse geohash (for example, 6-character precision) for analyst-facing GPS. The same input maps to the same token, allowing joins and fraud investigation without exposing the original value. The token service records key version and purpose, never the plaintext in application logs.
+Mình chọn **token hóa xác định** cho phone và identity bằng khóa do HSM/KMS quản lý, đồng thời dùng geohash thô (ví dụ độ chính xác 6 ký tự) cho GPS dành cho analyst. Cùng một đầu vào luôn tạo cùng một token, cho phép join và điều tra gian lận mà không lộ giá trị gốc. Dịch vụ token ghi lại phiên bản khóa và mục đích sử dụng, tuyệt đối không ghi plaintext vào application log.
 
-I reject **hashing without a managed key** because low-entropy phone numbers are vulnerable to dictionary attacks. I reject **masking only in the query UI** because raw PII would still exist in files, caches and ad-hoc exports. Exact GPS and reversible mappings are restricted to a break-glass service with approval and a separate audit stream.
+Mình loại **hash không có khóa được quản lý** vì số điện thoại có entropy thấp và dễ bị tấn công bằng từ điển. Mình loại **chỉ masking trên giao diện query** vì PII thô vẫn còn trong file, cache và các bản export ad-hoc. GPS chính xác và ánh xạ có thể đảo ngược chỉ được phép qua một dịch vụ break-glass, có phê duyệt và audit stream riêng.
 
-### Decision 4 — Partition by event date and city group; cluster the hot predicates
+### Quyết định 4 — Partition theo ngày sự kiện và nhóm thành phố; cluster theo predicate nóng
 
-I choose **`event_date` plus a bounded `city_group` partition**, targeting 128–512 MB Parquet files, and Z-order/clustering on `city_id`, `event_ts` and `trip_id`. This keeps the number of partitions manageable while allowing last-7-day city dashboards to prune files. Writers buffer micro-batches until the target file size rather than committing every Kafka message.
+Mình chọn partition **`event_date` cộng với `city_group` có giới hạn**, nhắm file Parquet 128–512 MB, và Z-order/clustering theo `city_id`, `event_ts`, `trip_id`. Cách này giữ số partition ở mức quản lý được, đồng thời cho dashboard thành phố 7 ngày gần nhất khả năng prune file. Writer gom micro-batch tới kích thước file mục tiêu thay vì commit cho từng message Kafka.
 
-I reject **one partition per trip or driver** because it creates a small-files and metadata outage. I reject **partitioning by exact event timestamp** because it creates too many tiny partitions. I also reject **partitioning only by city** because a city partition would grow indefinitely and make historical retention and parallel maintenance harder.
+Mình loại **mỗi trip hoặc driver một partition** vì sẽ tạo small-files và làm metadata quá tải. Mình loại **partition theo timestamp chính xác** vì tạo quá nhiều partition nhỏ. Mình cũng loại **chỉ partition theo city** vì partition của một thành phố sẽ phình vô hạn, khiến retention lịch sử và maintenance song song khó hơn.
 
-### Decision 5 — SCD Type 2 in Silver, current-state projection in Gold
+### Quyết định 5 — SCD Type 2 ở Silver, projection trạng thái hiện tại ở Gold
 
-I choose **SCD2** for trip status history with `valid_from`, `valid_to`, `is_current`, `source_scn` and `record_hash`. A late event is applied only when its source timestamp/SCN is newer than the current record; equal messages are idempotently ignored. Gold exposes a compact current-trip table and pre-aggregated city/day metrics for the dashboard.
+Mình chọn **SCD2** cho lịch sử trạng thái chuyến với `valid_from`, `valid_to`, `is_current`, `source_scn` và `record_hash`. Sự kiện trễ chỉ được áp dụng khi timestamp/SCN nguồn mới hơn bản ghi hiện tại; message trùng có SCN bằng nhau bị bỏ qua một cách idempotent. Gold cung cấp bảng chuyến hiện tại gọn nhẹ và các metric thành phố/ngày đã tổng hợp cho dashboard.
 
-I reject **overwrite-in-place** because it destroys the answer to “what did we know at 10:03?” and makes incident replay impossible. I reject **event-sourcing every query directly from Bronze** because analysts would repeatedly decode CDC envelopes and pay the latency cost. Silver is the governed history; Gold is the serving projection.
+Mình loại **overwrite tại chỗ** vì nó xóa câu trả lời cho “lúc 10:03 chúng ta đã biết gì?” và khiến replay sự cố bất khả thi. Mình loại **event-sourcing trực tiếp từ Bronze cho mọi query** vì analyst phải giải mã CDC envelope lặp đi lặp lại và chịu thêm độ trễ. Silver là lịch sử được quản trị; Gold là projection phục vụ truy vấn.
 
-### Decision 6 — REST catalog and policy enforcement at the table boundary
+### Quyết định 6 — REST catalog và policy enforcement tại biên bảng
 
-I choose a **REST-compatible catalog backed by PostgreSQL** for table names, schema versions, ownership and environment-specific credentials. Row filters limit analysts to permitted cities; column policies hide token mappings and exact GPS. The audit table records principal, query ID, table version, columns touched and purpose code.
+Mình chọn **catalog tương thích REST, dùng PostgreSQL làm backend** cho tên bảng, phiên bản schema, ownership và credential theo môi trường. Row filter giới hạn analyst theo thành phố được phép; column policy ẩn token mapping và GPS chính xác. Bảng audit ghi principal, query ID, version bảng, các cột đã chạm tới và mã mục đích.
 
-I reject **filesystem paths as the security boundary** because a path grants no consistent ownership, row policy or lineage. I reject **one vendor-only catalog API** because it would make future Trino, DuckDB or migration workflows expensive. The catalog is the control plane; Delta logs remain the table-level source of transaction truth.
+Mình loại **filesystem path làm ranh giới bảo mật** vì path không cung cấp ownership, row policy hay lineage nhất quán. Mình loại **một API catalog độc quyền của một vendor** vì sẽ làm các workflow Trino, DuckDB hoặc migration sau này đắt đỏ. Catalog là control plane; Delta log vẫn là nguồn sự thật cấp giao dịch của bảng.
 
-### Decision 7 — Retention and deletion are explicit jobs
+### Quyết định 7 — Retention và deletion là các job tường minh
 
-I choose 7 days of encrypted quarantine, 30 days of detailed sanitized Bronze, 365 days of Silver SCD2, and 2 years of Gold aggregates unless a legal hold exists. Delta VACUUM is run only after the retention guard; CDF consumers acknowledge delete events before old files are reclaimed. A deletion request creates an auditable tombstone and propagates through CDF to derived tables.
+Mình chọn vùng cách ly mã hóa 7 ngày, Bronze chi tiết đã làm sạch 30 ngày, Silver SCD2 365 ngày và Gold aggregate 2 năm, trừ khi có legal hold. Delta VACUUM chỉ chạy sau retention guard; consumer CDF phải xác nhận các sự kiện delete trước khi file cũ được thu hồi. Một yêu cầu xóa tạo tombstone có audit và lan truyền qua CDF tới các bảng dẫn xuất.
 
-I reject “keep everything forever” because storage and PII exposure grow without bound. I reject immediate physical deletion because active readers and downstream consumers may still reference a version. Time travel and erasure are reconciled by a documented retention window, legal holds and a deletion verification report.
+Mình loại **giữ mọi thứ vĩnh viễn** vì storage và mức phơi nhiễm PII sẽ tăng vô hạn. Mình loại **xóa vật lý ngay lập tức** vì reader đang hoạt động và consumer hạ nguồn có thể vẫn tham chiếu một version. Time travel và erasure được cân bằng bằng retention window có tài liệu, legal hold và báo cáo xác minh xóa.
 
-## 4. Failure modes and recovery
+## 4. Failure mode và khôi phục
 
-### Failure 1 — Kafka backlog exceeds the freshness budget
+### Failure 1 — Kafka backlog vượt ngân sách freshness
 
-**Detection:** consumer lag, end-to-end commit-to-Bronze latency and DLQ rate are paged; the SLO is 60 seconds.
-**Response:** pause non-critical CDF consumers, scale Debezium/Kafka partitions and prioritize trip-state topics.
-**Rollback:** do not skip offsets. Replay from the last committed SCN; Bronze writes are idempotent on `(source_table, primary_key, source_scn, op)`.
+**Phát hiện:** consumer lag, độ trễ commit-to-Bronze end-to-end và tỷ lệ DLQ được đưa vào cảnh báo; SLO là 60 giây.
+**Ứng phó:** tạm dừng các CDF consumer không quan trọng, scale Debezium/Kafka partition và ưu tiên topic trạng thái chuyến.
+**Rollback:** không bỏ qua offset. Replay từ SCN cuối đã commit; Bronze ghi idempotent theo `(source_table, primary_key, source_scn, op)`.
 
-### Failure 2 — Oracle schema change breaks the writer
+### Failure 2 — Thay đổi schema Oracle làm writer hỏng
 
-**Detection:** schema registry compatibility check and a Bronze quality gate reject unknown required fields before commit.
-**Response:** route incompatible events to the DLQ, alert the owning team and keep the last compatible writer serving.
-**Rollback:** Delta schema evolution is opt-in. Restore the previous table version if a bad merge was committed, then replay the quarantined events after the contract is updated.
+**Phát hiện:** schema registry compatibility check và Bronze quality gate từ chối field bắt buộc chưa biết trước khi commit.
+**Ứng phó:** chuyển event không tương thích vào DLQ, cảnh báo team sở hữu và giữ writer tương thích gần nhất tiếp tục phục vụ.
+**Rollback:** schema evolution của Delta là opt-in. Khôi phục version bảng trước đó nếu merge sai đã commit, sau đó replay event trong vùng cách ly khi contract đã được cập nhật.
 
-### Failure 3 — Late event rewrites a trip incorrectly
+### Failure 3 — Event trễ làm sửa sai một chuyến
 
-**Detection:** monitor event-time lateness, duplicate `(trip_id, source_scn)` keys and SCD2 overlap (`valid_from >= valid_to`).
-**Response:** isolate the affected trip IDs and stop only the repair job, not the entire ingestion stream.
-**Rollback:** use the Delta version before the repair, validate the source SCN ordering, then re-run the guarded MERGE. The old version remains available for incident comparison.
+**Phát hiện:** theo dõi event-time lateness, duplicate key `(trip_id, source_scn)` và overlap SCD2 (`valid_from >= valid_to`).
+**Ứng phó:** cô lập các trip ID bị ảnh hưởng và chỉ dừng repair job, không dừng toàn bộ ingestion stream.
+**Rollback:** dùng Delta version trước khi sửa, xác thực thứ tự SCN nguồn rồi chạy lại MERGE có guard. Version cũ vẫn còn để đối chiếu sự cố.
 
-### Failure 4 — PII appears in a readable table or log
+### Failure 4 — PII xuất hiện trong bảng hoặc log có thể đọc
 
-**Detection:** DLP scan on new Parquet files, tokenisation counters, and a canary query that must never return plaintext patterns.
-**Response:** revoke the offending principal, quarantine the table and rotate the token key if needed.
-**Rollback:** restore the last sanitized Delta version, delete contaminated derived files after downstream acknowledgements, and attach the incident ID to the audit/lineage record.
+**Phát hiện:** DLP scan trên Parquet mới, bộ đếm tokenization và canary query bắt buộc không bao giờ trả về pattern plaintext.
+**Ứng phó:** thu hồi principal vi phạm, cách ly bảng và xoay token key nếu cần.
+**Rollback:** khôi phục Delta version đã làm sạch gần nhất, xóa file dẫn xuất nhiễm bẩn sau khi downstream xác nhận và gắn incident ID vào bản ghi audit/lineage.
 
-## 5. Back-of-the-envelope cost estimate
+## 5. Ước tính chi phí sơ bộ
 
-Assumptions for a first-year steady state:
+Giả định cho trạng thái ổn định năm đầu:
 
-- 100M trips/year × 5 KB CDC payload ≈ 500 GB raw/year.
-- Sanitized Parquet plus Delta history, indexes and two replicas: 1.2 TB logical.
-- 30 days of detailed Bronze and 365 days of Silver are retained; Gold aggregates are 20 GB.
-- Object storage blended price: **$0.023/GB-month** for hot data, **$0.012/GB-month** for warm data.
+- 100M chuyến/năm × payload CDC 5 KB ≈ 500 GB raw/năm.
+- Parquet đã làm sạch cộng Delta history, index và hai bản replica: 1,2 TB logical.
+- Lưu Bronze chi tiết 30 ngày và Silver 365 ngày; Gold aggregate là 20 GB.
+- Giá object storage gộp: **$0.023/GB-tháng** cho dữ liệu hot, **$0.012/GB-tháng** cho dữ liệu warm.
 
-Storage estimate:
+Ước tính storage:
 
 ```text
-0.35 TB hot × $23/TB-month       = $8.05/month
-0.85 TB warm × $12/TB-month      = $10.20/month
-Kafka/DLQ temporary storage      ≈ $80/month
+0,35 TB hot × $23/TB-tháng       = $8,05/tháng
+0,85 TB warm × $12/TB-tháng      = $10,20/tháng
+Kafka/DLQ temporary storage      ≈ $80/tháng
 ------------------------------------------------
-Estimated storage subtotal        ≈ $98/month
+Tổng storage ước tính             ≈ $98/tháng
 ```
 
-Compute and operations dominate: two small Kafka/Debezium workers ($650/month), a streaming Delta job sized for the 30K writes/sec peak ($1,200/month), dashboard/query warehouse ($600/month), catalog/lineage/audit services ($300/month), and monitoring/DLP ($250/month). The first production estimate is therefore approximately **$2,450/month**, excluding Oracle licensing and people. The design keeps storage cheap by expiring detailed layers while preserving Gold aggregates; it keeps query cost predictable through compaction, projection and file pruning.
+Compute và vận hành chiếm phần lớn: hai worker Kafka/Debezium nhỏ ($650/tháng), một Delta streaming job đủ cho đỉnh 30K writes/giây ($1.200/tháng), dashboard/query warehouse ($600/tháng), dịch vụ catalog/lineage/audit ($300/tháng), monitoring/DLP ($250/tháng). Tổng ước tính production đầu tiên là khoảng **$2.450/tháng**, chưa tính license Oracle và nhân sự. Thiết kế giữ storage rẻ bằng cách hết hạn các lớp chi tiết nhưng bảo toàn Gold aggregate; chi phí query được kiểm soát nhờ compaction, projection và file pruning.
 
-## 6. One-week MVP slice
+## 6. Phạm vi MVP trong một tuần
 
-The first week will not ingest all regions. It will prove the hardest contracts on one city and 1% of production traffic:
+Tuần đầu không ingest toàn bộ khu vực. MVP sẽ chứng minh các contract khó nhất trên một thành phố và 1% traffic production:
 
-1. Capture Oracle CDC for the trip table with Debezium and preserve SCN/op/schema version in Kafka.
-2. Implement deterministic phone/ID tokenisation and coarse GPS geohash; add a plaintext canary test.
-3. Write append-only sanitized Bronze Delta with checkpoints and idempotent keys.
-4. Build one SCD2 Silver MERGE path with a 15-minute lateness window and one Gold city/day dashboard.
-5. Demonstrate a CDF delete, a time-travel rollback, a schema-drift rejection and a DLQ replay.
-6. Measure commit-to-dashboard latency, duplicate rate, file size, query p95 and audit completeness.
+1. Bắt CDC Oracle cho bảng trip bằng Debezium, giữ SCN/op/schema version trong Kafka.
+2. Triển khai token hóa xác định cho phone/ID và geohash GPS thô; thêm plaintext canary test.
+3. Ghi Bronze Delta append-only đã làm sạch, có checkpoint và khóa idempotent.
+4. Xây một đường SCD2 Silver MERGE với cửa sổ trễ 15 phút và một dashboard Gold theo thành phố/ngày.
+5. Chứng minh CDF delete, rollback bằng time travel, từ chối schema drift và replay DLQ.
+6. Đo latency commit-to-dashboard, tỷ lệ duplicate, kích thước file, p95 query và độ đầy đủ của audit.
 
-The MVP is successful when the dashboard stays under 60 seconds for the sampled traffic, a late event produces one corrected SCD2 interval, no plaintext PII is returned, and the rollback drill completes within 30 minutes. Only then would we expand city coverage and raise the Kafka partitions.
+MVP được xem là đạt khi dashboard duy trì dưới 60 giây với traffic mẫu, một event trễ tạo đúng một khoảng SCD2 đã sửa, không trả về PII plaintext và bài diễn tập rollback hoàn tất trong 30 phút. Chỉ sau đó mới mở rộng số thành phố và tăng số Kafka partition.
 
-## 7. Optional PoC
+## 7. PoC đi kèm
 
-The executable companion is [topic_c_tokenization.ipynb](poc/topic_c_tokenization.ipynb). It demonstrates two non-trivial contracts from this design: deterministic PII tokenisation before readable Bronze, and SCN-guarded CDC application that ignores late or duplicate events. Its assertions provide a small, runnable proof that plaintext PII does not enter the resulting state and that a lower SCN cannot overwrite a newer trip status.
+PoC có thể chạy được là [topic_c_tokenization.ipynb](poc/topic_c_tokenization.ipynb). PoC chứng minh hai contract không tầm thường trong thiết kế này: token hóa PII xác định trước Bronze có thể đọc, và áp dụng CDC có kiểm tra SCN để bỏ qua event trễ hoặc trùng. Các assertion cung cấp bằng chứng nhỏ, có thể chạy lại, rằng PII plaintext không đi vào state cuối và SCN thấp hơn không thể ghi đè trạng thái chuyến mới hơn.
 
-## Decision summary
+## Tóm tắt quyết định
 
-This design treats the lakehouse as both a serving system and an audit system: Delta provides ACID/CDF/time travel, the catalog provides policy and ownership, tokenisation limits PII exposure, and explicit maintenance/retention jobs control cost. The rejected alternatives are not universally bad; they are rejected because their failure modes conflict with this workload's freshness, compliance and replay requirements.
+Thiết kế này xem lakehouse vừa là hệ thống phục vụ truy vấn vừa là hệ thống audit: Delta cung cấp ACID/CDF/time travel, catalog cung cấp policy và ownership, token hóa hạn chế phơi nhiễm PII, còn các job maintenance/retention tường minh kiểm soát chi phí. Các phương án bị loại không phải lúc nào cũng xấu; chúng bị loại vì failure mode của chúng xung đột với yêu cầu freshness, compliance và replay của workload này.
